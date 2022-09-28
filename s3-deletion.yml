@@ -1,0 +1,143 @@
+AWSTemplateFormatVersion: 2010-09-09
+
+#############################################
+
+Description: automatically delete resources when cloudformation stack get deleted
+
+
+Resources:
+
+  EmptyBucketLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement: 
+          - Effect: "Allow"
+            Principal: 
+              Service:
+                - lambda.amazonaws.com
+                - events.amazonaws.com
+            Action: 
+            - 'sts:AssumeRole'
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AWSLambda_FullAccess
+        - arn:aws:iam::aws:policy/CloudWatchFullAccess
+        - arn:aws:iam::aws:policy/AmazonS3FullAccess
+
+  
+  S3Bucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      VersioningConfiguration:
+        Status: Enabled
+
+  S3AccessPoint1:
+    Type: 'AWS::S3::AccessPoint'
+    Properties:
+      Bucket: !Ref S3Bucket
+      Name: acpt1
+      Policy:
+        Version: 2012-10-17
+        Statement:
+          - Action: "*"
+            Effect: Deny
+            Resource: !Sub 'arn:aws:s3:${AWS::Region}:${AWS::AccountId}:accesspoint/acpt1/object/*'
+            Principal: "*"
+            Condition:
+             NotIpAddress:
+               aws:SourceIp: 54.240.143.0/24
+
+  S3AccessPoint2:
+    Type: 'AWS::S3::AccessPoint'
+    Properties:
+      Bucket: !Ref S3Bucket
+      Name: acpt2
+    
+
+
+
+
+  EmptyS3BucketLambdaFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      Handler: index.lambda_handler
+      Code:
+        ZipFile: |
+          from __future__ import print_function
+          import json, boto3, logging
+          import urllib3
+          import json
+          logger = logging.getLogger()
+          logger.setLevel(logging.INFO)
+          SUCCESS = "SUCCESS"
+          FAILED = "FAILED"
+          
+          def lambda_handler(event, context):
+            logger.info("event: {}".format(event))
+            try:
+                bucket = event['ResourceProperties']['BucketName']
+                accountid = event['ResourceProperties']['AccountId']
+                logger.info("bucket: {}, event['RequestType']: {}".format(bucket,event['RequestType']))
+                if event['RequestType'] == 'Delete':
+                   s3 = boto3.resource('s3')
+                   s3client = boto3.client('s3control') 
+                   obj_bucket = s3.Bucket(bucket)
+                   print('hi')
+                   for obj in obj_bucket.objects.filter():
+                       logger.info("delete obj: {}".format(obj))
+                       s3.Object(obj_bucket.name, obj.key).delete()
+                       obj_bucket.object_versions.filter(Prefix=obj.key).delete()
+                       logger.info("Permanently deleted all versions of object %s.", obj.key)  
+                   obj_bucket.object_versions.all().delete()
+                   for ap in s3client.list_access_points(AccountId=accountid,Bucket=bucket, MaxResults=123)['AccessPointList']:
+                       print('hello')
+                       print(ap)
+                       ap_name=ap['Name']
+                       print(ap_name)
+                       response = s3client.delete_access_point(AccountId=accountid,Name=ap_name)
+                sendResponseCfn(event, context, SUCCESS)
+            except Exception as e:
+                  logger.info("Exception: {}".format(e))
+                  sendResponseCfn(event, context, FAILED)
+          
+          def sendResponseCfn(event, context, responseStatus):
+            responseData = {}
+            responseData['Data'] = {}
+            send(event, context, responseStatus, responseData, "CustomResourcePhysicalID")
+          http = urllib3.PoolManager()
+          def send(event, context, responseStatus, responseData, physicalResourceId=None, noEcho=False, reason=None):
+              responseUrl = event['ResponseURL']
+              print(responseUrl)
+              responseBody = {
+                  'Status' : responseStatus,
+                  'Reason' : reason or "See the details in CloudWatch Log Stream: {}".format(context.log_stream_name),
+                  'PhysicalResourceId' : physicalResourceId or context.log_stream_name,
+                  'StackId' : event['StackId'],
+                  'RequestId' : event['RequestId'],
+                  'LogicalResourceId' : event['LogicalResourceId'],
+                  'NoEcho' : noEcho,
+                  'Data' : responseData
+              }
+              json_responseBody = json.dumps(responseBody)
+              print("Response body:")
+              print(json_responseBody)
+              headers = {
+                  'content-type' : '',
+                  'content-length' : str(len(json_responseBody))
+              }
+              try:
+                  response = http.request('PUT', responseUrl, headers=headers, body=json_responseBody)
+                  print("Status code:", response.status)
+              except Exception as e: 
+                  print("send(..) failed executing http.request(..):", e)
+      Role: !GetAtt EmptyBucketLambdaRole.Arn
+      Runtime: python3.7  
+      Timeout: 30     
+########################## Custom resources #########################
+  cleanups3Bucket:
+    Type: Custom::s3Bucket
+    Properties:
+      ServiceToken: !GetAtt EmptyS3BucketLambdaFunction.Arn
+      BucketName: !Ref S3Bucket
+      AccountId: !Ref AWS::AccountId
